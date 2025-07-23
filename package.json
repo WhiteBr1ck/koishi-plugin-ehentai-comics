@@ -1,22 +1,46 @@
 {
   "name": "koishi-plugin-ehentai-comics",
-  "description": "ehentai",
-  "version": "0.0.1",
+  "version": "0.1.0",
+  "description": "一个用于在 E-Hentai/ExHentai 上搜索和下载漫画的 Koishi 插件",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
     "lib",
     "dist"
   ],
+  "author": "WhiteBr1ck (https://github.com/WhiteBr1ck)",
   "license": "MIT",
-  "scripts": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WhiteBr1ck/koishi-plugin-ehentai-comics.git"
+  },
+  "bugs": {
+    "url": "https://github.com/WhiteBr1ck/koishi-plugin-ehentai-comics/issues"
+  },
+  "homepage": "https://github.com/WhiteBr1ck/koishi-plugin-ehentai-comics#readme",
   "keywords": [
-    "chatbot",
     "koishi",
-    "plugin"
+    "plugin",
+    "e-hentai",
+    "exhentai",
+    "downloader",
+    "comic",
+    "comics"
   ],
-  "devDependencies": {},
+  "koishi": {
+    "name": "E-Hentai 漫画下载",
+    "description": "开箱即用，允许用户搜索 E-Hentai/ExHentai 上的漫画，或根据链接下载为图片或PDF文件。",
+    "service": {
+      "required": ["http"]
+    }
+  },
   "peerDependencies": {
-    "koishi": "^4.18.7"
+    "koishi": "^4.17.0"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12",
+    "muhammara": "^4.2.0",
+    "sharp": "^0.33.4"
   }
+    
 }
