@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-ehentai-comics",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "一个用于在 E-Hentai/ExHentai 上搜索和下载漫画的 Koishi 插件",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
@@ -35,12 +35,12 @@
     }
   },
   "peerDependencies": {
-    "koishi": "^4.17.0"
+    "koishi": "^4.18.7"
   },
   "dependencies": {
     "cheerio": "^1.0.0-rc.12",
-    "muhammara": "^4.2.0",
-    "sharp": "^0.33.4"
+    "muhammara": "^5.3.0",
+    "sharp": "^0.33.5"
   }
     
 }

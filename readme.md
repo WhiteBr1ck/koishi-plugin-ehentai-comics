@@ -117,4 +117,4 @@ npm install koishi-plugin-ehentai-comics
 
 本项目使用 [MIT License](./LICENSE) 开源。
 
-Copyright (c) 2024 WhiteBr1ck (https://github.com/WhiteBr1ck)
+Copyright (c) 2025 WhiteBr1ck (https://github.com/WhiteBr1ck)
