@@ -24,10 +24,12 @@ export interface Config {
   site: 'e-hentai.org' | 'exhentai.org'
   ipb_member_id?: string
   ipb_pass_hash?: string
+  igneous?: string
   searchResultCount: number
   useForwardForSearch: boolean
   useForwardForImages: boolean
   showImageInSearch: boolean
+  splitMessagesInSearch: boolean // [!code ++]
   downloadPath: string
   defaultToPdf: boolean
   pdfPassword?: string
@@ -49,6 +51,7 @@ export const Config: Schema<Config> = Schema.intersect([
     ]).description('选择要使用的站点。').default('e-hentai.org'),
     ipb_member_id: Schema.string().description('（可选）您的 `ipb_member_id` Cookie 值，用于登录 ExHentai。').role('secret'),
     ipb_pass_hash: Schema.string().description('（可选）您的 `ipb_pass_hash` Cookie 值，用于登录 ExHentai。').role('secret'),
+    igneous: Schema.string().description('（可选）您的 `igneous` Cookie 值，登录 ExHentai 时可能需要。').role('secret'),
   }).description('站点与登录设置'),
 
   Schema.object({
@@ -56,6 +59,7 @@ export const Config: Schema<Config> = Schema.intersect([
     useForwardForSearch: Schema.boolean().description('【QQ平台】是否默认使用合并转发的形式发送【搜索结果】。').default(true),
     useForwardForImages: Schema.boolean().description('【QQ平台】当以图片形式发送漫画时，是否默认使用【合并转发】。').default(true),
     showImageInSearch: Schema.boolean().description('是否在【搜索结果】中显示封面图片。').default(true),
+    splitMessagesInSearch: Schema.boolean().description('【搜索结果】是否将文本和图片分开。').default(false), // [!code ++]
   }).description('消息发送设置'),
   
   Schema.object({
@@ -81,12 +85,11 @@ export const Config: Schema<Config> = Schema.intersect([
 ])
 
 export function apply(ctx: Context, config: Config) {
-  // Add login status log on startup
   if (config.site === 'exhentai.org') {
     if (config.ipb_member_id && config.ipb_pass_hash) {
-      logger.info('ExHentai 模式已启用，并检测到 Cookie 配置。');
+      logger.info(`ExHentai 模式已启用，并检测到 Cookie 配置${config.igneous ? ' (包含 igneous)' : ''}。`);
     } else {
-      logger.warn('ExHentai 模式已启用，但未配置 Cookie。访问受限内容可能会失败。');
+      logger.warn('ExHentai 模式已启用，但未完整配置 Cookie。访问受限内容可能会失败。');
     }
   }
 
@@ -94,12 +97,13 @@ export function apply(ctx: Context, config: Config) {
   const apiBase = `https://api.e-hentai.org/api.php`
 
   function buildHeaders() {
-    let userCookies = '';
-    if (config.ipb_member_id && config.ipb_pass_hash) {
-      userCookies = `ipb_member_id=${config.ipb_member_id}; ipb_pass_hash=${config.ipb_pass_hash};`;
-    }
+    const cookieParts: string[] = [];
+    if (config.ipb_member_id) cookieParts.push(`ipb_member_id=${config.ipb_member_id}`);
+    if (config.ipb_pass_hash) cookieParts.push(`ipb_pass_hash=${config.ipb_pass_hash}`);
+    if (config.igneous) cookieParts.push(`igneous=${config.igneous}`);
+    
     return {
-      'Cookie': userCookies,
+      'Cookie': cookieParts.join('; '),
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
       'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
@@ -153,6 +157,24 @@ export function apply(ctx: Context, config: Config) {
     }
   }
   
+  async function scrapeWithRetry<T>(url: string, parser: (html: string) => T): Promise<T | null> {
+    for (let i = 0; i <= config.downloadRetries; i++) {
+      try {
+        await sleep(config.scrapeDelay * 1000);
+        const html = await ctx.http.get<string>(url, { headers: buildHeaders() });
+        return parser(html);
+      } catch (error) {
+        if (i < config.downloadRetries) {
+          if (config.debug) logger.warn(`[抓取] 页面 ${url} 失败 (第 ${i + 1} 次), 2秒后重试...`);
+          await sleep(2000);
+        } else {
+          logger.error(`[抓取] 页面 ${url} 在重试 ${config.downloadRetries} 次后最终失败。`);
+          return null;
+        }
+      }
+    }
+  }
+
   async function getImageUrlsFromGallery(gid: string, gtoken: string): Promise<string[]> {
       const gdata = await getGalleryMetadata([{ gid, token: gtoken }]);
       const [metadata] = gdata;
@@ -161,47 +183,87 @@ export function apply(ctx: Context, config: Config) {
       const fileCount = parseInt(metadata.filecount, 10);
       const galleryUrl = `${siteBase}/g/${gid}/${gtoken}/`;
       const allImageUrls: string[] = new Array(fileCount).fill(null);
-      let foundCount = 0;
       
       logger.info(`[抓取] 画廊共有 ${fileCount} 张图片。开始抓取图片链接...`);
-      const pageCount = Math.ceil(fileCount / 40);
-      for (let p = 0; p < pageCount; p++) {
-          const pageUrl = `${galleryUrl}?p=${p}`;
-          if (config.debug) logger.info(`[抓取] 正在处理缩略图页面 ${p + 1}/${pageCount}... URL: ${pageUrl}`);
-          const pageHtml = await ctx.http.get<string>(pageUrl, { headers: buildHeaders() });
-          const $ = load(pageHtml);
-          if ($('#gdt').length === 0) {
-            logger.error(`[抓取] 错误：页面 ${pageUrl} HTML内容中未找到画廊元素(#gdt)。`);
-            break;
-          }
-          const pageLinks: string[] = [];
-          $('#gdt a').each((_, elem) => {
-            const href = $(elem).attr('href');
-            if(href && href.includes('/s/')) pageLinks.push(href);
-          });
-          if (config.debug) logger.info(`[抓取] 页面 ${p + 1} 找到 ${pageLinks.length} 个图片链接。`);
-          for (const link of pageLinks) {
-              await sleep(config.scrapeDelay * 1000);
-              try {
-                  const imagePageHtml = await ctx.http.get<string>(link, { headers: buildHeaders() });
-                  const $$ = load(imagePageHtml);
-                  const imageUrl = $$('#img').attr('src');
-                  const linkIndexMatch = link.match(/-(\d+)$/);
-                  if (imageUrl && linkIndexMatch) {
-                      const index = parseInt(linkIndexMatch[1], 10) - 1;
-                      if(index < allImageUrls.length && !allImageUrls[index]) {
-                        allImageUrls[index] = imageUrl;
-                        foundCount++;
-                      }
-                  } else {
-                      logger.warn(`[抓取] 在 ${link} 未找到图片URL或索引。imageUrl: ${!!imageUrl}, linkIndexMatch: ${!!linkIndexMatch}`);
-                  }
-              } catch (e) {
-                  logger.warn(`[抓取] 访问图片详情页失败: ${link}`, { error: e });
-              }
-          }
+      
+      const allDetailLinks: string[] = [];
+
+      const firstPageUrl = `${galleryUrl}?p=0`;
+      const firstPageLinks = await scrapeWithRetry(firstPageUrl, (html) => {
+        const $ = load(html);
+        if ($('#gdt').length === 0) {
+          logger.error(`[抓取] 错误：页面 ${firstPageUrl} HTML内容中未找到画廊元素(#gdt)。`);
+          return [];
+        }
+        const links: string[] = [];
+        $('#gdt a').each((_, elem) => {
+          const href = $(elem).attr('href');
+          if(href && href.includes('/s/')) links.push(href);
+        });
+        return links;
+      });
+
+      if (!firstPageLinks || firstPageLinks.length === 0) {
+        logger.error(`[抓取] 无法从第一页获取任何图片链接，任务中止。请检查网络或 Cookie。`);
+        return [];
       }
-      logger.info(`[抓取] 抓取完成，共找到 ${foundCount}/${fileCount} 个有效图片链接。`);
+
+      const thumbsPerPage = firstPageLinks.length;
+      const pageCount = Math.ceil(fileCount / thumbsPerPage);
+      logger.info(`[抓取] 动态检测到每页有 ${thumbsPerPage} 个缩略图。预计总页数: ${pageCount}。`);
+      allDetailLinks.push(...firstPageLinks);
+      
+      if (pageCount > 1) {
+        const remainingPagePromises = Array.from({ length: pageCount - 1 }, (_, i) => {
+          const pageNum = i + 1;
+          const pageUrl = `${galleryUrl}?p=${pageNum}`;
+          return scrapeWithRetry(pageUrl, (html) => {
+            const $ = load(html);
+            const links: string[] = [];
+            $('#gdt a').each((_, elem) => {
+              const href = $(elem).attr('href');
+              if (href && href.includes('/s/')) links.push(href);
+            });
+            if (config.debug) logger.info(`[抓取] 页面 ${pageNum + 1}/${pageCount} (${pageUrl}) 找到 ${links.length} 个详情链接。`);
+            return links;
+          });
+        });
+        const resultsOfRemainingPages = await Promise.all(remainingPagePromises);
+        resultsOfRemainingPages.forEach(links => {
+          if (links) allDetailLinks.push(...links);
+        });
+      }
+
+      logger.info(`[抓取] 阶段一完成：共收集到 ${allDetailLinks.length} 个有效的图片详情页链接。`);
+
+      const detailPagePromises = allDetailLinks.map(link => {
+        return scrapeWithRetry(link, (html) => {
+          const $$ = load(html);
+          const imageUrl = $$('#img').attr('src');
+          const linkIndexMatch = link.match(/-(\d+)$/);
+          if (imageUrl && linkIndexMatch) {
+            const index = parseInt(linkIndexMatch[1], 10) - 1;
+            return { index, imageUrl };
+          }
+          logger.warn(`[抓取] 在 ${link} 未找到图片URL或索引。`);
+          return null;
+        });
+      });
+
+      const resultsOfDetails = await Promise.all(detailPagePromises);
+      let foundCount = 0;
+      for (const result of resultsOfDetails) {
+        if (result && result.index < allImageUrls.length && !allImageUrls[result.index]) {
+          allImageUrls[result.index] = result.imageUrl;
+          foundCount++;
+        }
+      }
+      
+      logger.info(`[抓取] 阶段二完成：成功提取 ${foundCount}/${fileCount} 个最终图片链接。`);
+      if (foundCount < fileCount) {
+        logger.warn(`[抓取] 警告：发现漏页现象，应有 ${fileCount} 张，实际找到 ${foundCount} 张。请检查网络或目标画廊。`);
+      }
+      
       return allImageUrls.filter(url => !!url);
   }
 
@@ -236,47 +298,116 @@ export function apply(ctx: Context, config: Config) {
       const [statusMessageId] = await session.send(h('quote', { id: session.messageId }) + '正在搜索...');
       try {
         const results = await searchGalleries(keyword);
-        if (results.length === 0) return '未找到任何结果。';
+        if (results.length === 0) {
+          await session.send('未找到任何结果。');
+          return;
+        }
         
-        const messageElements: h[] = [h('p', `搜索到 ${results.length} 个结果，为您展示前 ${Math.min(results.length, config.searchResultCount)} 个：`)];
-        for (const [index, gallery] of results.entries()) {
-          messageElements.push(h('p', '──────────'));
-          const parsedTags = { parody: [], character: [], group: [], artist: [], male: [], female: [], misc: [] };
-          for (const tag of gallery.tags) {
-            const parts = tag.split(':');
-            if (parts.length > 1) {
-              const namespace = parts[0];
-              const tagName = parts.slice(1).join(':');
-              if (parsedTags[namespace]) parsedTags[namespace].push(tagName);
-              else parsedTags.misc.push(tag);
+        const useForward = config.useForwardForSearch && ['qq', 'onebot'].includes(session.platform);
+
+        if (useForward) {
+          // --- 合并转发逻辑 ---
+          const forwardElements: h[] = [h('p', `搜索到 ${results.length} 个结果，为您展示前 ${Math.min(results.length, config.searchResultCount)} 个：`)];
+
+          for (const [index, gallery] of results.entries()) {
+            const textElements: h[] = [];
+            const parsedTags = { parody: [], character: [], group: [], artist: [], male: [], female: [], misc: [] };
+            for (const tag of gallery.tags) {
+              const parts = tag.split(':');
+              if (parts.length > 1) {
+                const namespace = parts[0];
+                const tagName = parts.slice(1).join(':');
+                if (parsedTags[namespace]) parsedTags[namespace].push(tagName); else parsedTags.misc.push(tag);
+              } else {
+                parsedTags.misc.push(tag);
+              }
+            }
+            let tagInfo = `[标题] ${gallery.title}\n`;
+            if (parsedTags.parody.length > 0) tagInfo += `[原作] ${parsedTags.parody.join(', ')}\n`;
+            if (parsedTags.artist.length > 0) tagInfo += `[作者] ${parsedTags.artist.join(', ')}\n`;
+            if (parsedTags.group.length > 0) tagInfo += `[团体] ${parsedTags.group.join(', ')}\n`;
+            if (parsedTags.character.length > 0) tagInfo += `[角色] ${parsedTags.character.join(', ')}\n`;
+            const otherTags = [...parsedTags.female, ...parsedTags.male, ...parsedTags.misc];
+            if (otherTags.length > 0) tagInfo += `[标签] ${otherTags.slice(0, 8).join(', ')}${otherTags.length > 8 ? '...' : ''}\n`;
+            tagInfo += `[URL] ${gallery.url}`;
+            
+            textElements.push(h('p', '──────────'));
+            textElements.push(h('p', tagInfo));
+
+            const imageElement = (config.showImageInSearch && gallery.thumb) ? await (async () => {
+              try {
+                const result = await downloadImage(gallery.thumb, index, siteBase + '/');
+                return ('buffer' in result) ? h.image(bufferToDataURI(result.buffer)) : null;
+              } catch (e) {
+                if (config.debug) logger.warn(`[搜索] 下载封面失败: ${gallery.thumb}`, e);
+                return null;
+              }
+            })() : null;
+
+            if (config.splitMessagesInSearch) {
+              // 分离模式：文本和图片成为两个独立的转发节点
+              forwardElements.push(h('message', textElements));
+              if (imageElement) forwardElements.push(h('message', imageElement));
             } else {
-              parsedTags.misc.push(tag);
+              // 合并模式：文本和图片在同一个转发节点
+              if (imageElement) textElements.push(imageElement);
+              forwardElements.push(h('message', textElements));
             }
           }
-          let tagInfo = `[标题] ${gallery.title}\n`;
-          if (parsedTags.parody.length > 0) tagInfo += `[原作] ${parsedTags.parody.join(', ')}\n`;
-          if (parsedTags.artist.length > 0) tagInfo += `[作者] ${parsedTags.artist.join(', ')}\n`;
-          if (parsedTags.group.length > 0) tagInfo += `[团体] ${parsedTags.group.join(', ')}\n`;
-          if (parsedTags.character.length > 0) tagInfo += `[角色] ${parsedTags.character.join(', ')}\n`;
-          const otherTags = [...parsedTags.female, ...parsedTags.male, ...parsedTags.misc];
-          if (otherTags.length > 0) tagInfo += `[标签] ${otherTags.slice(0, 8).join(', ')}${otherTags.length > 8 ? '...' : ''}\n`;
-          tagInfo += `[URL] ${gallery.url}`
-          messageElements.push(h('p', tagInfo));
-          if (config.showImageInSearch && gallery.thumb) {
-              try {
-                  const result = await downloadImage(gallery.thumb, index, siteBase + '/');
-                  if ('buffer' in result) {
-                    messageElements.push(h.image(bufferToDataURI(result.buffer)));
-                  }
-              } catch (e) {
-                  if(config.debug) logger.warn(`[搜索] 下载封面失败: ${gallery.thumb}`, e);
-              }
-          }
-        }
-        if (config.useForwardForSearch && ['qq', 'onebot'].includes(session.platform)) {
-          await session.send(h('figure', {}, messageElements));
+          await session.send(h('figure', {}, forwardElements));
+
         } else {
-          await session.send(messageElements);
+          // --- 逐条发送逻辑 ---
+          await session.send(`搜索到 ${results.length} 个结果，为您展示前 ${Math.min(results.length, config.searchResultCount)} 个：`);
+          
+          for (const [index, gallery] of results.entries()) {
+            const textElements: h[] = [];
+            const parsedTags = { parody: [], character: [], group: [], artist: [], male: [], female: [], misc: [] };
+            for (const tag of gallery.tags) {
+              const parts = tag.split(':');
+              if (parts.length > 1) {
+                const namespace = parts[0];
+                const tagName = parts.slice(1).join(':');
+                if (parsedTags[namespace]) parsedTags[namespace].push(tagName); else parsedTags.misc.push(tag);
+              } else {
+                parsedTags.misc.push(tag);
+              }
+            }
+            let tagInfo = `[标题] ${gallery.title}\n`;
+            if (parsedTags.parody.length > 0) tagInfo += `[原作] ${parsedTags.parody.join(', ')}\n`;
+            if (parsedTags.artist.length > 0) tagInfo += `[作者] ${parsedTags.artist.join(', ')}\n`;
+            if (parsedTags.group.length > 0) tagInfo += `[团体] ${parsedTags.group.join(', ')}\n`;
+            if (parsedTags.character.length > 0) tagInfo += `[角色] ${parsedTags.character.join(', ')}\n`;
+            const otherTags = [...parsedTags.female, ...parsedTags.male, ...parsedTags.misc];
+            if (otherTags.length > 0) tagInfo += `[标签] ${otherTags.slice(0, 8).join(', ')}${otherTags.length > 8 ? '...' : ''}\n`;
+            tagInfo += `[URL] ${gallery.url}`;
+            
+            textElements.push(h('p', '──────────'));
+            textElements.push(h('p', tagInfo));
+
+            const imageElement = (config.showImageInSearch && gallery.thumb) ? await (async () => {
+              try {
+                const result = await downloadImage(gallery.thumb, index, siteBase + '/');
+                return ('buffer' in result) ? h.image(bufferToDataURI(result.buffer)) : null;
+              } catch (e) {
+                if (config.debug) logger.warn(`[搜索] 下载封面失败: ${gallery.thumb}`, e);
+                return null;
+              }
+            })() : null;
+
+            if (config.splitMessagesInSearch) {
+              // 分离模式：先发文本，再发图片
+              await session.send(textElements);
+              await sleep(500);
+              if (imageElement) await session.send(imageElement);
+              await sleep(500);
+            } else {
+              // 合并模式：文本和图片一起发
+              if (imageElement) textElements.push(imageElement);
+              await session.send(textElements);
+              await sleep(1000);
+            }
+          }
         }
       } catch (error) {
           logger.error(`[搜索] 命令执行失败。关键词: "${keyword}"`, { error })

@@ -75,6 +75,8 @@ npm install koishi-plugin-ehentai-comics
   - **默认值**: `true`
 - **`showImageInSearch`**: 是否在【搜索结果】中显示封面图片。
   - **默认值**: `true`
+- **`splitMessagesInSearch`**: 【搜索结果】是否将文本和图片分开。
+  - **默认值**: `false`
 
 #### PDF 设置
 
