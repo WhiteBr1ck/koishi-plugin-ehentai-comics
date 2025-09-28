@@ -33,6 +33,8 @@ export interface Config {
   downloadPath: string
   defaultToPdf: boolean
   pdfPassword?: string
+  enableTitleObfuscation: boolean
+  titleObfuscationChar: string
   enableCompression: boolean
   compressionQuality: number
   pdfSendMethod: 'buffer' | 'file'
@@ -66,6 +68,8 @@ export const Config: Schema<Config> = Schema.intersect([
     downloadPath: Schema.string().description('PDF 文件和临时文件的保存目录。').default('./data/downloads/ehentai'),
     defaultToPdf: Schema.boolean().description('是否默认将漫画下载为 PDF 文件。').default(true),
     pdfPassword: Schema.string().role('secret').description('（可选）为生成的 PDF 文件设置一个打开密码。留空则不加密。'),
+    enableTitleObfuscation: Schema.boolean().description('是否启用标题混淆以规避审核。').default(false),
+    titleObfuscationChar: Schema.string().description('标题混淆时插入的字符。').default('.'),
     enableCompression: Schema.boolean().description('【PDF模式】是否启用图片压缩以减小 PDF 文件体积。').default(true),
     compressionQuality: Schema.number().min(1).max(100).step(1).role('slider').default(80)
       .description('【PDF模式】JPEG 图片质量 (1-100)。'),
@@ -443,7 +447,12 @@ export function apply(ctx: Context, config: Config) {
         if (outputType === 'pdf') {
           const [metadata] = await getGalleryMetadata([{ gid, token: gtoken }]);
           const galleryTitle = metadata?.title_jpn || metadata?.title || gid;
-          const safeFilename = galleryTitle.replace(/[\\/:\*\?"<>\|]/g, '_');
+          let safeFilename = galleryTitle.replace(/[\\/:\*\?"<>\|]/g, '_');
+
+          // 标题混淆功能
+          if (config.enableTitleObfuscation) {
+            safeFilename = safeFilename.split('').join(config.titleObfuscationChar);
+          }
           const downloadDir = path.resolve(ctx.app.baseDir, config.downloadPath);
           const tempPdfPath = path.resolve(downloadDir, `${safeFilename}_${Date.now()}.pdf`);
           const finalPdfPath = path.resolve(downloadDir, `${safeFilename}.pdf`);

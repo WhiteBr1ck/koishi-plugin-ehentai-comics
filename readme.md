@@ -85,6 +85,10 @@ npm install koishi-plugin-ehentai-comics
 - **`defaultToPdf`**: 是否默认将漫画下载为 PDF 文件。
   - **默认值**: `true`
 - **`pdfPassword`**: (可选) 为生成的 PDF 文件设置一个打开密码。留空则不加密。
+- **`enableTitleObfuscation`**: 是否启用标题混淆以规避审核。在PDF文件名的每个字符之间插入指定字符。
+  - **默认值**: `false`
+- **`titleObfuscationChar`**: 标题混淆时插入的字符。
+  - **默认值**: `.`
 - **`enableCompression`**: (PDF模式) 是否启用图片压缩以减小 PDF 文件体积。
   - **默认值**: `true`
 - **`compressionQuality`**: (PDF模式) JPEG 图片质量 (1-100)。
@@ -106,6 +110,12 @@ npm install koishi-plugin-ehentai-comics
   - **默认值**: `1`
 - **`debug`**: 是否在控制台输出详细的调试日志。用于排查问题。
   - **默认值**: `false`
+
+## 📝 更新日志
+
+### v0.1.3
+- 新增PDF文件名混淆功能，可在文件名中插入字符规避QQ审核
+- 添加 `enableTitleObfuscation` 和 `titleObfuscationChar` 配置项
 
 ## ⚠️ 免责声明
 
