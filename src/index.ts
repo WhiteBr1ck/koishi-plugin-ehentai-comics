@@ -1,8 +1,10 @@
 import { Context, Schema, Logger, h, Session, sleep } from 'koishi'
 import * as path from 'path'
+import { createWriteStream } from 'fs'
 import { mkdir, rm, readFile, unlink, rename } from 'fs/promises'
 import { pathToFileURL } from 'url'
-import { Recipe } from 'muhammara'
+import { once } from 'events'
+import PDFDocument from 'pdfkit'
 import sharp from 'sharp'
 import { load } from 'cheerio'
 
@@ -14,6 +16,24 @@ export const inject = {
 const logger = new Logger(name)
 
 const galleryUrlRegex = /(e-hentai\.org|exhentai\.org)\/g\/(\d+)\/([a-f0-9]+)\/?/
+
+type OutputType = 'pdf' | 'image'
+type AutoLinkDownloadOutput = 'default' | OutputType
+type GalleryTitleDisplay = 'default' | 'english' | 'japanese' | 'all'
+
+interface SearchResult {
+  url: string
+  title: string
+  titleEn?: string
+  titleJpn?: string
+  thumb: string
+  tags: string[]
+}
+
+interface SearchSelectionState {
+  results: SearchResult[]
+  expiresAt: number
+}
 
 // Helper function to convert buffer to Data URI
 function bufferToDataURI(buffer: Buffer, mime = 'image/jpeg'): string {
@@ -29,10 +49,17 @@ export interface Config {
   useForwardForSearch: boolean
   useForwardForImages: boolean
   showImageInSearch: boolean
-  splitMessagesInSearch: boolean // [!code ++]
+  splitMessagesInSearch: boolean
+  enableAutoLinkDownload: boolean
+  autoLinkDownloadOutput: AutoLinkDownloadOutput
+  enableSearchIndexDownload: boolean
+  searchSelectionTimeout: number
+  galleryTitleDisplay: GalleryTitleDisplay
   downloadPath: string
   defaultToPdf: boolean
   pdfPassword?: string
+  keepLocalFiles: boolean
+  sendPdfPasswordAfterDownload: boolean
   enableTitleObfuscation: boolean
   titleObfuscationChar: string
   enableCompression: boolean
@@ -61,13 +88,29 @@ export const Config: Schema<Config> = Schema.intersect([
     useForwardForSearch: Schema.boolean().description('【QQ平台】是否默认使用合并转发的形式发送【搜索结果】。').default(true),
     useForwardForImages: Schema.boolean().description('【QQ平台】当以图片形式发送漫画时，是否默认使用【合并转发】。').default(true),
     showImageInSearch: Schema.boolean().description('是否在【搜索结果】中显示封面图片。').default(true),
-    splitMessagesInSearch: Schema.boolean().description('【搜索结果】是否将文本和图片分开。').default(false), // [!code ++]
+    splitMessagesInSearch: Schema.boolean().description('【搜索结果】是否将文本和图片分开。').default(false),
+    enableAutoLinkDownload: Schema.boolean().description('是否自动识别消息中的 E-Hentai/ExHentai 画廊链接并下载。').default(false),
+    autoLinkDownloadOutput: Schema.union([
+      Schema.const('default').description('跟随默认下载设置'),
+      Schema.const('pdf').description('PDF'),
+      Schema.const('image').description('图片'),
+    ]).description('自动识别链接时的下载格式。').default('default'),
+    enableSearchIndexDownload: Schema.boolean().description('搜索后是否允许发起搜索的用户输入序号下载对应结果，或输入 q 取消。').default(true),
+    searchSelectionTimeout: Schema.number().min(10).max(600).step(10).description('搜索结果序号选择的有效期，单位秒。').default(120),
+    galleryTitleDisplay: Schema.union([
+      Schema.const('default').description('站点页面默认标题'),
+      Schema.const('english').description('英文标题'),
+      Schema.const('japanese').description('日文标题'),
+      Schema.const('all').description('全部可用标题'),
+    ]).description('搜索结果和下载文件名优先使用的标题语言。E-Hentai API 通常只提供英文标题和日文标题。').default('default'),
   }).description('消息发送设置'),
   
   Schema.object({
     downloadPath: Schema.string().description('PDF 文件和临时文件的保存目录。').default('./data/downloads/ehentai'),
     defaultToPdf: Schema.boolean().description('是否默认将漫画下载为 PDF 文件。').default(true),
     pdfPassword: Schema.string().role('secret').description('（可选）为生成的 PDF 文件设置一个打开密码。留空则不加密。'),
+    keepLocalFiles: Schema.boolean().description('下载并发送完成后，是否保留生成的 PDF 本地文件。关闭时会沿用当前逻辑，发送后自动删除。').default(false),
+    sendPdfPasswordAfterDownload: Schema.boolean().description('任务完成后是否发送 PDF 打开密码。仅在配置了 PDF 密码时生效。').default(false),
     enableTitleObfuscation: Schema.boolean().description('是否启用标题混淆以规避审核。').default(false),
     titleObfuscationChar: Schema.string().description('标题混淆时插入的字符。').default('.'),
     enableCompression: Schema.boolean().description('【PDF模式】是否启用图片压缩以减小 PDF 文件体积。').default(true),
@@ -99,6 +142,91 @@ export function apply(ctx: Context, config: Config) {
 
   const siteBase = `https://${config.site}`
   const apiBase = `https://api.e-hentai.org/api.php`
+  const searchSessions = new Map<string, SearchSelectionState>()
+  const activeDownloads = new Set<string>()
+
+  function getSessionKey(session: Session) {
+    return `${session.platform}:${session.guildId || ''}:${session.channelId}:${session.userId}`
+  }
+
+  function extractPlainText(session: Session) {
+    const elements = session.elements?.length ? session.elements : h.parse(session.content || '')
+    const text = elements
+      .filter(element => element.type === 'text')
+      .map(element => element.attrs?.content ?? element.children?.join('') ?? '')
+      .join('')
+      .trim()
+    return text || session.content?.replace(/<[^>]+>/g, '').trim() || ''
+  }
+
+  async function sendSearchSelectionPrompt(session: Session, results: SearchResult[]) {
+    await session.send(`请在 ${config.searchSelectionTimeout} 秒内输入序号下载，或输入 q 取消。可选范围：1-${results.length}`)
+  }
+
+  function normalizeGalleryUrl(url: string) {
+    return /^https?:\/\//i.test(url) ? url : `https://${url}`
+  }
+
+  function parseGalleryUrl(url: string) {
+    const match = url.match(galleryUrlRegex)
+    if (!match) return null
+    const [, host, gid, gtoken] = match
+    return { host, gid, gtoken, url: normalizeGalleryUrl(match[0]) }
+  }
+
+  function getDefaultOutputType(): OutputType {
+    return config.defaultToPdf ? 'pdf' : 'image'
+  }
+
+  function resolveOutputType(output?: string): OutputType {
+    return output === 'image' || output === 'pdf' ? output : getDefaultOutputType()
+  }
+
+  function resolveAutoLinkOutputType(): OutputType {
+    return config.autoLinkDownloadOutput === 'default' ? getDefaultOutputType() : config.autoLinkDownloadOutput
+  }
+
+  function pickTitle(gallery: Pick<SearchResult, 'title' | 'titleEn' | 'titleJpn'>) {
+    if (config.galleryTitleDisplay === 'english') return gallery.titleEn || gallery.title || gallery.titleJpn || ''
+    if (config.galleryTitleDisplay === 'japanese') return gallery.titleJpn || gallery.title || gallery.titleEn || ''
+    return gallery.title || gallery.titleEn || gallery.titleJpn || ''
+  }
+
+  function formatTitleLines(gallery: Pick<SearchResult, 'title' | 'titleEn' | 'titleJpn'>) {
+    if (config.galleryTitleDisplay !== 'all') return [`[标题] ${pickTitle(gallery)}`]
+
+    const lines: string[] = []
+    if (gallery.title) lines.push(`[默认标题] ${gallery.title}`)
+    if (gallery.titleEn && gallery.titleEn !== gallery.title) lines.push(`[英文标题] ${gallery.titleEn}`)
+    if (gallery.titleJpn && gallery.titleJpn !== gallery.title && gallery.titleJpn !== gallery.titleEn) lines.push(`[日文标题] ${gallery.titleJpn}`)
+    return lines.length ? lines : ['[标题] 未知标题']
+  }
+
+  function formatSearchResult(gallery: SearchResult, index: number) {
+    const parsedTags: Record<string, string[]> = { parody: [], character: [], group: [], artist: [], male: [], female: [], misc: [] }
+    for (const tag of gallery.tags) {
+      const parts = tag.split(':')
+      if (parts.length > 1) {
+        const namespace = parts[0]
+        const tagName = parts.slice(1).join(':')
+        if (parsedTags[namespace]) parsedTags[namespace].push(tagName)
+        else parsedTags.misc.push(tag)
+      } else {
+        parsedTags.misc.push(tag)
+      }
+    }
+
+    let tagInfo = `[序号] ${index + 1}\n`
+    tagInfo += `${formatTitleLines(gallery).join('\n')}\n`
+    if (parsedTags.parody.length > 0) tagInfo += `[原作] ${parsedTags.parody.join(', ')}\n`
+    if (parsedTags.artist.length > 0) tagInfo += `[作者] ${parsedTags.artist.join(', ')}\n`
+    if (parsedTags.group.length > 0) tagInfo += `[团体] ${parsedTags.group.join(', ')}\n`
+    if (parsedTags.character.length > 0) tagInfo += `[角色] ${parsedTags.character.join(', ')}\n`
+    const otherTags = [...parsedTags.female, ...parsedTags.male, ...parsedTags.misc]
+    if (otherTags.length > 0) tagInfo += `[标签] ${otherTags.slice(0, 8).join(', ')}${otherTags.length > 8 ? '...' : ''}\n`
+    tagInfo += `[URL] ${gallery.url}`
+    return tagInfo
+  }
 
   function buildHeaders() {
     const cookieParts: string[] = [];
@@ -135,13 +263,13 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  async function searchGalleries(keyword: string): Promise<{ url: string, title: string, thumb: string, tags: string[] }[]> {
+  async function searchGalleries(keyword: string): Promise<SearchResult[]> {
     const searchUrl = `${siteBase}/?f_search=${encodeURIComponent(keyword)}`
     if (config.debug) logger.info(`[搜索] 正在抓取搜索页面: ${searchUrl}`)
     try {
       const html = await ctx.http.get<string>(searchUrl, { headers: buildHeaders() })
       const $ = load(html)
-      const results: { url: string, title: string, thumb: string, tags: string[] }[] = []
+      const results: SearchResult[] = []
       $('table.gltc tbody tr').each((i, elem) => {
         const linkElement = $(elem).find('td.gl3c a')
         const imgElement = $(elem).find('td.gl2c img')
@@ -154,7 +282,24 @@ export function apply(ctx: Context, config: Config) {
         })
         if (url && title) results.push({ url, title, thumb, tags })
       })
-      return results.slice(0, config.searchResultCount);
+      const slicedResults = results.slice(0, config.searchResultCount);
+      const metadataTargets = slicedResults.map(result => parseGalleryUrl(result.url)).filter(Boolean);
+      if (metadataTargets.length > 0) {
+        const metadataList = await getGalleryMetadata(metadataTargets.map(({ gid, gtoken }) => ({ gid, token: gtoken })));
+        const metadataByGid = new Map<string, any>();
+        for (const metadata of metadataList) {
+          if (metadata?.gid) metadataByGid.set(String(metadata.gid), metadata);
+        }
+        for (const result of slicedResults) {
+          const parsed = parseGalleryUrl(result.url);
+          if (!parsed) continue;
+          const metadata = metadataByGid.get(parsed.gid);
+          if (!metadata) continue;
+          result.titleEn = metadata.title;
+          result.titleJpn = metadata.title_jpn;
+        }
+      }
+      return slicedResults;
     } catch (error) {
       logger.error(`[搜索] 抓取或解析搜索页面失败: ${keyword}`, { error });
       return [];
@@ -183,7 +328,7 @@ export function apply(ctx: Context, config: Config) {
       const gdata = await getGalleryMetadata([{ gid, token: gtoken }]);
       const [metadata] = gdata;
       if (!metadata) throw new Error('无法获取画廊元数据，请检查Cookie或站点配置。');
-      
+
       const fileCount = parseInt(metadata.filecount, 10);
       const galleryUrl = `${siteBase}/g/${gid}/${gtoken}/`;
       const allImageUrls: string[] = new Array(fileCount).fill(null);
@@ -296,6 +441,165 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
+  async function handleGalleryDownload(session: Session, url: string, output?: string) {
+    if (!url) return '请输入画廊 URL。';
+    const parsedGallery = parseGalleryUrl(url);
+    if (!parsedGallery) return 'URL 格式不正确。请输入一个有效的 E-Hentai/ExHentai 画廊链接。';
+
+    const { gid, gtoken } = parsedGallery;
+    const downloadKey = getSessionKey(session);
+    if (activeDownloads.has(downloadKey)) return '当前会话已有下载任务正在进行，请等待完成后再试。';
+
+    activeDownloads.add(downloadKey);
+    const [statusMessageId] = await session.send(h('quote', { id: session.messageId }) + `收到请求，正在处理画廊 ${gid}...`);
+    try {
+      if (config.debug) logger.info(`[下载] 开始处理画廊 ${gid}/${gtoken}`);
+      const allImageUrls = await getImageUrlsFromGallery(gid, gtoken);
+      if (allImageUrls.length === 0) return '任务中止：未能从画廊页面中提取到任何图片链接，请检查后台日志以确认失败原因。';
+
+      logger.info(`[下载] 链接抓取成功，共 ${allImageUrls.length} 张图片，准备下载...`);
+      const reportFailures = async (failedIndexes: number[]) => {
+        if (failedIndexes.length > 0) {
+          const sortedIndexes = failedIndexes.map(i => i + 1).sort((a, b) => a - b);
+          await session.send(`任务完成，但以下图片下载失败，已跳过：\n第 ${sortedIndexes.join(', ')} 张。`);
+        }
+      };
+      const outputType = resolveOutputType(output);
+      if (outputType === 'pdf') {
+        const [metadata] = await getGalleryMetadata([{ gid, token: gtoken }]);
+        const galleryTitle = pickTitle({ title: metadata?.title || gid, titleEn: metadata?.title, titleJpn: metadata?.title_jpn }) || gid;
+        let safeFilename = galleryTitle.replace(/[\\/:\*\?"<>\|]/g, '_');
+
+        if (config.enableTitleObfuscation) {
+          safeFilename = safeFilename.split('').join(config.titleObfuscationChar);
+        }
+        const downloadDir = path.resolve(ctx.app.baseDir, config.downloadPath);
+        const tempPdfPath = path.resolve(downloadDir, `${safeFilename}_${Date.now()}.pdf`);
+        const finalPdfPath = path.resolve(downloadDir, `${safeFilename}.pdf`);
+        const tempImageDir = path.resolve(downloadDir, `temp_${gid}_${Date.now()}`);
+        await mkdir(tempImageDir, { recursive: true });
+        const failedImageIndexes: number[] = [];
+        try {
+          const pdfOptions: any = {
+            autoFirstPage: false,
+            pdfVersion: '1.7',
+          };
+          if (config.pdfPassword) {
+            pdfOptions.userPassword = config.pdfPassword;
+            pdfOptions.ownerPassword = config.pdfPassword;
+            pdfOptions.permissions = {
+              printing: 'highResolution',
+              modifying: false,
+              copying: false,
+              annotating: false,
+              fillingForms: false,
+              contentAccessibility: false,
+              documentAssembly: false,
+            };
+          }
+          const doc = new PDFDocument(pdfOptions);
+          const pdfStream = createWriteStream(tempPdfPath);
+          doc.pipe(pdfStream);
+
+          const successfulDownloads: { index: number; buffer: Buffer }[] = [];
+          for (let i = 0; i < allImageUrls.length; i += config.downloadConcurrency) {
+            const chunk = allImageUrls.slice(i, i + config.downloadConcurrency);
+            if (config.debug) logger.info(`[下载] [PDF] 正在下载批次 ${Math.floor(i / config.downloadConcurrency) + 1}...`);
+            const chunkPromises = chunk.map((url, idx) => downloadImage(url, i + idx));
+            const chunkResults = await Promise.all(chunkPromises);
+            for (const result of chunkResults) {
+              if ('buffer' in result) successfulDownloads.push(result);
+              else failedImageIndexes.push(result.index);
+            }
+          }
+          successfulDownloads.sort((a,b) => a.index - b.index);
+          for (const { index, buffer } of successfulDownloads) {
+              if (config.debug) logger.info(`[下载] [PDF] 正在处理第 ${index + 1}/${allImageUrls.length} 张图片并添加到PDF...`);
+              const imagePath = path.resolve(tempImageDir, `${index + 1}.jpg`);
+              const sharpInstance = sharp(buffer);
+              const jpegOptions: sharp.JpegOptions = {};
+              if (config.enableCompression) { jpegOptions.quality = config.compressionQuality; }
+              const imageBuffer = await sharpInstance.jpeg(jpegOptions).toBuffer();
+              await sharp(imageBuffer).toFile(imagePath);
+              const md = await sharp(imageBuffer).metadata();
+              if (!md.width || !md.height) throw new Error(`无法读取第 ${index + 1} 张图片尺寸。`);
+              doc.addPage({ size: [md.width, md.height], margin: 0 });
+              doc.image(imageBuffer, 0, 0, { width: md.width, height: md.height });
+          }
+          doc.end();
+          await once(pdfStream, 'finish');
+          await rename(tempPdfPath, finalPdfPath);
+          logger.info(`[下载] [PDF] 正在发送 PDF 文件: ${finalPdfPath}`);
+          const fileAttributes = { filename: `${safeFilename}.pdf`, title: `${safeFilename}.pdf` };
+          if (config.pdfSendMethod === 'buffer') {
+            const pdfBuffer = await readFile(finalPdfPath);
+            await session.send(h.file(pdfBuffer, 'application/pdf', fileAttributes));
+          } else {
+            await session.send(h.file(pathToFileURL(finalPdfPath).href, fileAttributes));
+          }
+          if (config.pdfPassword && config.sendPdfPasswordAfterDownload) {
+            await session.send(`PDF 打开密码：${config.pdfPassword}`);
+          }
+        } finally {
+          if (!config.keepLocalFiles) {
+            try { await unlink(finalPdfPath) } catch (e) {}
+          } else if (config.debug) {
+            logger.info(`[下载] 已按配置保留 PDF 本地文件: ${finalPdfPath}`);
+          }
+          try { await unlink(tempPdfPath) } catch (e) {}
+          try { await rm(tempImageDir, { recursive: true, force: true }) } catch(e) {}
+          await reportFailures(failedImageIndexes);
+        }
+      } else {
+          if (config.useForwardForImages && ['qq', 'onebot'].includes(session.platform)) {
+            const forwardElements: h[] = [];
+            const failedImageIndexes: number[] = [];
+            for (let i = 0; i < allImageUrls.length; i += config.downloadConcurrency) {
+              const chunk = allImageUrls.slice(i, i + config.downloadConcurrency);
+              const chunkPromises = chunk.map((url, idx) => downloadImage(url, i + idx));
+              const chunkResults = await Promise.all(chunkPromises);
+              for (const result of chunkResults) {
+                if ('buffer' in result) {
+                  forwardElements.push(h.image(bufferToDataURI(result.buffer)));
+                } else {
+                  failedImageIndexes.push(result.index);
+                  forwardElements.push(h('p', `第 ${result.index + 1} 张图片下载失败`));
+                }
+              }
+            }
+            if (forwardElements.length > 0) await session.send(h('figure', {}, forwardElements));
+            else await session.send('所有图片都下载失败了，无法发送。');
+          } else {
+            for (const [index, imageUrl] of allImageUrls.entries()) {
+              try {
+                const result = await downloadImage(imageUrl, index);
+                if ('buffer' in result) {
+                    await session.send([
+                      h('p', `第 ${index + 1} / ${allImageUrls.length} 张`),
+                      h.image(bufferToDataURI(result.buffer))
+                    ]);
+                } else {
+                    await session.send(`发送第 ${index + 1} 张图片失败(下载错误)，已跳过。`);
+                }
+              } catch (error) {
+                logger.warn(`[下载] 发送单张图片失败。GID: ${gid}, 图片URL: ${imageUrl}`, { error });
+                await session.send(`发送第 ${index + 1} 张图片失败，已跳过。`);
+              }
+              await sleep(1500);
+            }
+          }
+      }
+    } catch (error) {
+      logger.error(`[下载] 任务失败。GID: ${gid}`, { error: error.message, stack: error.stack });
+      return h('quote', { id: session.messageId }) + `下载失败：${error.message}`;
+    } finally {
+      activeDownloads.delete(downloadKey);
+      try { await session.bot.deleteMessage(session.channelId, statusMessageId); } catch (e) {
+        if (config.debug) logger.warn('撤回初始状态消息失败', e);
+      }
+    }
+  }
+
   ctx.command('ehsearch <keyword:text>', 'E-Hentai 漫画搜索')
     .action(async ({ session }, keyword) => {
       if (!keyword) return '请输入关键词。'
@@ -306,34 +610,22 @@ export function apply(ctx: Context, config: Config) {
           await session.send('未找到任何结果。');
           return;
         }
+        const searchSessionKey = getSessionKey(session);
+        searchSessions.set(searchSessionKey, {
+          results,
+          expiresAt: Date.now() + config.searchSelectionTimeout * 1000,
+        });
+        if (config.debug) logger.info(`[选择] 已创建搜索选择状态。Key: ${searchSessionKey}, 结果数: ${results.length}`);
         
         const useForward = config.useForwardForSearch && ['qq', 'onebot'].includes(session.platform);
 
         if (useForward) {
           // --- 合并转发逻辑 ---
-          const forwardElements: h[] = [h('p', `搜索到 ${results.length} 个结果，为您展示前 ${Math.min(results.length, config.searchResultCount)} 个：`)];
+          const forwardElements: h[] = [h('p', `搜索到 ${results.length} 个结果，为您展示前 ${Math.min(results.length, config.searchResultCount)} 个。`)];
 
           for (const [index, gallery] of results.entries()) {
             const textElements: h[] = [];
-            const parsedTags = { parody: [], character: [], group: [], artist: [], male: [], female: [], misc: [] };
-            for (const tag of gallery.tags) {
-              const parts = tag.split(':');
-              if (parts.length > 1) {
-                const namespace = parts[0];
-                const tagName = parts.slice(1).join(':');
-                if (parsedTags[namespace]) parsedTags[namespace].push(tagName); else parsedTags.misc.push(tag);
-              } else {
-                parsedTags.misc.push(tag);
-              }
-            }
-            let tagInfo = `[标题] ${gallery.title}\n`;
-            if (parsedTags.parody.length > 0) tagInfo += `[原作] ${parsedTags.parody.join(', ')}\n`;
-            if (parsedTags.artist.length > 0) tagInfo += `[作者] ${parsedTags.artist.join(', ')}\n`;
-            if (parsedTags.group.length > 0) tagInfo += `[团体] ${parsedTags.group.join(', ')}\n`;
-            if (parsedTags.character.length > 0) tagInfo += `[角色] ${parsedTags.character.join(', ')}\n`;
-            const otherTags = [...parsedTags.female, ...parsedTags.male, ...parsedTags.misc];
-            if (otherTags.length > 0) tagInfo += `[标签] ${otherTags.slice(0, 8).join(', ')}${otherTags.length > 8 ? '...' : ''}\n`;
-            tagInfo += `[URL] ${gallery.url}`;
+            const tagInfo = formatSearchResult(gallery, index);
             
             textElements.push(h('p', '──────────'));
             textElements.push(h('p', tagInfo));
@@ -359,32 +651,15 @@ export function apply(ctx: Context, config: Config) {
             }
           }
           await session.send(h('figure', {}, forwardElements));
+          if (config.enableSearchIndexDownload) await sendSearchSelectionPrompt(session, results);
 
         } else {
           // --- 逐条发送逻辑 ---
-          await session.send(`搜索到 ${results.length} 个结果，为您展示前 ${Math.min(results.length, config.searchResultCount)} 个：`);
+          await session.send(`搜索到 ${results.length} 个结果，为您展示前 ${Math.min(results.length, config.searchResultCount)} 个。`);
           
           for (const [index, gallery] of results.entries()) {
             const textElements: h[] = [];
-            const parsedTags = { parody: [], character: [], group: [], artist: [], male: [], female: [], misc: [] };
-            for (const tag of gallery.tags) {
-              const parts = tag.split(':');
-              if (parts.length > 1) {
-                const namespace = parts[0];
-                const tagName = parts.slice(1).join(':');
-                if (parsedTags[namespace]) parsedTags[namespace].push(tagName); else parsedTags.misc.push(tag);
-              } else {
-                parsedTags.misc.push(tag);
-              }
-            }
-            let tagInfo = `[标题] ${gallery.title}\n`;
-            if (parsedTags.parody.length > 0) tagInfo += `[原作] ${parsedTags.parody.join(', ')}\n`;
-            if (parsedTags.artist.length > 0) tagInfo += `[作者] ${parsedTags.artist.join(', ')}\n`;
-            if (parsedTags.group.length > 0) tagInfo += `[团体] ${parsedTags.group.join(', ')}\n`;
-            if (parsedTags.character.length > 0) tagInfo += `[角色] ${parsedTags.character.join(', ')}\n`;
-            const otherTags = [...parsedTags.female, ...parsedTags.male, ...parsedTags.misc];
-            if (otherTags.length > 0) tagInfo += `[标签] ${otherTags.slice(0, 8).join(', ')}${otherTags.length > 8 ? '...' : ''}\n`;
-            tagInfo += `[URL] ${gallery.url}`;
+            const tagInfo = formatSearchResult(gallery, index);
             
             textElements.push(h('p', '──────────'));
             textElements.push(h('p', tagInfo));
@@ -412,6 +687,7 @@ export function apply(ctx: Context, config: Config) {
               await sleep(1000);
             }
           }
+          if (config.enableSearchIndexDownload) await sendSearchSelectionPrompt(session, results);
         }
       } catch (error) {
           logger.error(`[搜索] 命令执行失败。关键词: "${keyword}"`, { error })
@@ -426,127 +702,51 @@ export function apply(ctx: Context, config: Config) {
   ctx.command('ehdownload <url:string>', 'E-Hentai 漫画下载')
     .option('output', '-o <type:string>')
     .action(async ({ session, options }, url) => {
-      if (!url) return '请输入画廊 URL。';
-      const match = url.match(galleryUrlRegex);
-      if (!match) return 'URL 格式不正确。请输入一个有效的 E-Hentai/ExHentai 画廊链接。';
-      const [, , gid, gtoken] = match;
-      const [statusMessageId] = await session.send(h('quote', { id: session.messageId }) + `收到请求，正在处理画廊 ${gid}...`);
-      try {
-        if (config.debug) logger.info(`[下载] 开始处理画廊 ${gid}/${gtoken}`);
-        const allImageUrls = await getImageUrlsFromGallery(gid, gtoken);
-        if (allImageUrls.length === 0) return '任务中止：未能从画廊页面中提取到任何图片链接，请检查后台日志以确认失败原因。';
-        
-        logger.info(`[下载] 链接抓取成功，共 ${allImageUrls.length} 张图片，准备下载...`);
-        const reportFailures = async (failedIndexes: number[]) => {
-          if (failedIndexes.length > 0) {
-            const sortedIndexes = failedIndexes.map(i => i + 1).sort((a, b) => a - b);
-            await session.send(`任务完成，但以下图片下载失败，已跳过：\n第 ${sortedIndexes.join(', ')} 张。`);
-          }
-        };
-        const outputType = options.output || (config.defaultToPdf ? 'pdf' : 'image');
-        if (outputType === 'pdf') {
-          const [metadata] = await getGalleryMetadata([{ gid, token: gtoken }]);
-          const galleryTitle = metadata?.title_jpn || metadata?.title || gid;
-          let safeFilename = galleryTitle.replace(/[\\/:\*\?"<>\|]/g, '_');
-
-          // 标题混淆功能
-          if (config.enableTitleObfuscation) {
-            safeFilename = safeFilename.split('').join(config.titleObfuscationChar);
-          }
-          const downloadDir = path.resolve(ctx.app.baseDir, config.downloadPath);
-          const tempPdfPath = path.resolve(downloadDir, `${safeFilename}_${Date.now()}.pdf`);
-          const finalPdfPath = path.resolve(downloadDir, `${safeFilename}.pdf`);
-          const tempImageDir = path.resolve(downloadDir, `temp_${gid}_${Date.now()}`);
-          await mkdir(tempImageDir, { recursive: true });
-          let recipe: Recipe;
-          const failedImageIndexes: number[] = [];
-          try {
-            recipe = new Recipe("new", tempPdfPath, { version: 1.6 });
-            const successfulDownloads: { index: number; buffer: Buffer }[] = [];
-            for (let i = 0; i < allImageUrls.length; i += config.downloadConcurrency) {
-              const chunk = allImageUrls.slice(i, i + config.downloadConcurrency);
-              if (config.debug) logger.info(`[下载] [PDF] 正在下载批次 ${Math.floor(i / config.downloadConcurrency) + 1}...`);
-              const chunkPromises = chunk.map((url, idx) => downloadImage(url, i + idx));
-              const chunkResults = await Promise.all(chunkPromises);
-              for (const result of chunkResults) {
-                if ('buffer' in result) successfulDownloads.push(result);
-                else failedImageIndexes.push(result.index);
-              }
-            }
-            successfulDownloads.sort((a,b) => a.index - b.index);
-            for (const { index, buffer } of successfulDownloads) {
-                if (config.debug) logger.info(`[下载] [PDF] 正在处理第 ${index + 1}/${allImageUrls.length} 张图片并添加到PDF...`);
-                const imagePath = path.resolve(tempImageDir, `${index + 1}.jpg`);
-                const sharpInstance = sharp(buffer);
-                const jpegOptions: sharp.JpegOptions = {};
-                if (config.enableCompression) { jpegOptions.quality = config.compressionQuality; }
-                await sharpInstance.jpeg(jpegOptions).toFile(imagePath);
-                const md = await sharp(imagePath).metadata();
-                recipe.createPage(md.width, md.height).image(imagePath, 0, 0).endPage();
-            }
-            if (config.pdfPassword) recipe.encrypt({ userPassword: config.pdfPassword, ownerPassword: config.pdfPassword });
-            recipe.endPDF();
-            await rename(tempPdfPath, finalPdfPath);
-            logger.info(`[下载] [PDF] 正在发送 PDF 文件: ${finalPdfPath}`);
-            const fileAttributes = { filename: `${safeFilename}.pdf`, title: `${safeFilename}.pdf` };
-            if (config.pdfSendMethod === 'buffer') {
-              const pdfBuffer = await readFile(finalPdfPath);
-              await session.send(h.file(pdfBuffer, 'application/pdf', fileAttributes));
-            } else {
-              await session.send(h.file(pathToFileURL(finalPdfPath).href, fileAttributes));
-            }
-          } finally {
-            try { await unlink(finalPdfPath) } catch (e) {}
-            try { await unlink(tempPdfPath) } catch (e) {}
-            try { await rm(tempImageDir, { recursive: true, force: true }) } catch(e) {}
-            await reportFailures(failedImageIndexes);
-          }
-        } else {
-            if (config.useForwardForImages && ['qq', 'onebot'].includes(session.platform)) {
-              const forwardElements: h[] = [];
-              const failedImageIndexes: number[] = [];
-              for (let i = 0; i < allImageUrls.length; i += config.downloadConcurrency) {
-                const chunk = allImageUrls.slice(i, i + config.downloadConcurrency);
-                const chunkPromises = chunk.map((url, idx) => downloadImage(url, i + idx));
-                const chunkResults = await Promise.all(chunkPromises);
-                for (const result of chunkResults) {
-                  if ('buffer' in result) {
-                    forwardElements.push(h.image(bufferToDataURI(result.buffer)));
-                  } else {
-                    failedImageIndexes.push(result.index);
-                    forwardElements.push(h('p', `第 ${result.index + 1} 张图片下载失败`));
-                  }
-                }
-              }
-              if (forwardElements.length > 0) await session.send(h('figure', {}, forwardElements));
-              else await session.send('所有图片都下载失败了，无法发送。');
-            } else { 
-              for (const [index, imageUrl] of allImageUrls.entries()) {
-                try {
-                  const result = await downloadImage(imageUrl, index);
-                  if ('buffer' in result) {
-                      await session.send([
-                        h('p', `第 ${index + 1} / ${allImageUrls.length} 张`),
-                        h.image(bufferToDataURI(result.buffer))
-                      ]);
-                  } else {
-                      await session.send(`发送第 ${index + 1} 张图片失败(下载错误)，已跳过。`);
-                  }
-                } catch (error) {
-                  logger.warn(`[下载] 发送单张图片失败。GID: ${gid}, 图片URL: ${imageUrl}`, { error });
-                  await session.send(`发送第 ${index + 1} 张图片失败，已跳过。`);
-                }
-                await sleep(1500);
-              }
-            }
-        }
-      } catch (error) {
-        logger.error(`[下载] 任务失败。GID: ${gid}`, { error: error.message, stack: error.stack });
-        return h('quote', { id: session.messageId }) + `下载失败：${error.message}`;
-      } finally {
-        try { await session.bot.deleteMessage(session.channelId, statusMessageId); } catch (e) {
-          if (config.debug) logger.warn('撤回初始状态消息失败', e);
-        }
-      }
+      return handleGalleryDownload(session, url, options.output);
     })
+
+  ctx.middleware(async (session, next) => {
+    const rawContent = session.content?.trim() || '';
+    const content = extractPlainText(session);
+    if (!rawContent && !content) return next();
+
+    if (config.debug) logger.info(`[选择] 收到消息。用户: ${session.userId || 'unknown'}, 原始内容: ${rawContent}, 纯文本: ${content}`);
+
+    if (config.enableSearchIndexDownload) {
+      const sessionKey = getSessionKey(session);
+      const searchState = searchSessions.get(sessionKey);
+      if (searchState) {
+        if (Date.now() > searchState.expiresAt) {
+          searchSessions.delete(sessionKey);
+          return '搜索结果已过期，请重新搜索。';
+        }
+
+        if (/^q$/i.test(content)) {
+          searchSessions.delete(sessionKey);
+          return '已取消本次搜索结果选择。';
+        }
+
+        if (/^\d+$/.test(content)) {
+          const selectedIndex = Number(content) - 1;
+          const selectedGallery = searchState.results[selectedIndex];
+          if (selectedGallery) {
+            searchSessions.delete(sessionKey);
+            return handleGalleryDownload(session, selectedGallery.url);
+          }
+          return `序号无效，请回复 1-${searchState.results.length} 之间的数字，或回复 q 取消。`;
+        }
+
+        return `请输入 1-${searchState.results.length} 之间的序号，或回复 q 取消。`;
+      }
+    }
+
+    if (config.enableAutoLinkDownload && !/^\s*eh(?:search|download)\b/i.test(content)) {
+      const parsedGallery = parseGalleryUrl(rawContent || content);
+      if (parsedGallery) {
+        return handleGalleryDownload(session, parsedGallery.url, resolveAutoLinkOutputType());
+      }
+    }
+
+    return next();
+  }, true)
 }
