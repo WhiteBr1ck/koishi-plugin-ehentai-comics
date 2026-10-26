@@ -144,6 +144,9 @@ npm install koishi-plugin-ehentai-comics
 
 ## 📝 更新日志
 
+### v0.2.3
+- 修复长 PDF 文件名导致 QQ 上传和临时文件创建失败。
+
 ### v0.2.0
 - 新增自动识别 E-Hentai / ExHentai 画廊链接并下载的功能，默认关闭，可通过 `enableAutoLinkDownload` 启用。
 - 新增搜索结果序号下载功能。搜索后发起搜索的用户可在有效期内输入序号下载，或输入 `q` 取消。
