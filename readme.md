@@ -111,6 +111,7 @@ npm install koishi-plugin-ehentai-comics
   - **默认值**: `true`
 - **`pdfPassword`**: (可选) 为生成的 PDF 文件设置一个打开密码。留空则不加密。
 - PDF 生成使用纯 JavaScript 实现，不需要用户额外安装本地编译工具。
+- PDF 本地文件名和发送文件名在替换非法字符及可选标题混淆后，按 UTF-8 编码限制为 **255 字节（包含 `.pdf` 扩展名）**，不是 255 个字符。超长标题会按完整 Unicode 字符截短，并附加画廊 ID，避免不同画廊截短后重名；未超限的文件名保持不变。此处理对 Buffer 和 File 两种发送方式均生效，临时 PDF 使用独立的短文件名。
 - **`keepLocalFiles`**: 下载并发送完成后，是否保留生成的 PDF 本地文件。关闭时会沿用默认逻辑，发送后自动删除。
   - **默认值**: `false`
 - **`sendPdfPasswordAfterDownload`**: 任务完成后是否发送 PDF 打开密码。仅在配置了 `pdfPassword` 时生效。

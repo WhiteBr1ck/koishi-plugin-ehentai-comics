@@ -40,6 +40,18 @@ function bufferToDataURI(buffer: Buffer, mime = 'image/jpeg'): string {
   return `data:${mime};base64,${buffer.toString('base64')}`;
 }
 
+function truncateUtf8(value: string, maxBytes: number): string {
+  let result = '';
+  let byteLength = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, 'utf8');
+    if (byteLength + characterBytes > maxBytes) break;
+    result += character;
+    byteLength += characterBytes;
+  }
+  return result;
+}
+
 export interface Config {
   site: 'e-hentai.org' | 'exhentai.org'
   ipb_member_id?: string
@@ -471,12 +483,17 @@ export function apply(ctx: Context, config: Config) {
         let safeFilename = galleryTitle.replace(/[\\/:\*\?"<>\|]/g, '_');
 
         if (config.enableTitleObfuscation) {
-          safeFilename = safeFilename.split('').join(config.titleObfuscationChar);
+          safeFilename = Array.from(safeFilename).join(config.titleObfuscationChar);
+        }
+        if (Buffer.byteLength(`${safeFilename}.pdf`, 'utf8') > 255) {
+          const suffix = `_${gid}`;
+          const maxTitleBytes = 255 - Buffer.byteLength(`${suffix}.pdf`, 'utf8');
+          safeFilename = truncateUtf8(safeFilename, maxTitleBytes) + suffix;
         }
         const downloadDir = path.resolve(ctx.app.baseDir, config.downloadPath);
-        const tempPdfPath = path.resolve(downloadDir, `${safeFilename}_${Date.now()}.pdf`);
-        const finalPdfPath = path.resolve(downloadDir, `${safeFilename}.pdf`);
         const tempImageDir = path.resolve(downloadDir, `temp_${gid}_${Date.now()}`);
+        const tempPdfPath = path.resolve(tempImageDir, 'download.pdf');
+        const finalPdfPath = path.resolve(downloadDir, `${safeFilename}.pdf`);
         await mkdir(tempImageDir, { recursive: true });
         const failedImageIndexes: number[] = [];
         try {
